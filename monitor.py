@@ -77,6 +77,7 @@ def _check(item):
     except Exception as e:
         return name, url, f"error:{type(e).__name__}", None, None
 
+
 def check(item):
     res = _check(item)
     if res[2].startswith("error"):
