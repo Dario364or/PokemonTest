@@ -1,14 +1,14 @@
-import os, sys, time, re
-from concurrent.futures import ThreadPoolExecutor
-import requests
+import os, sys, time, re, random
+import requests                      # solo para Telegram
+from curl_cffi import requests as cr # para Carrefour (huella de Chrome)
 from bs4 import BeautifulSoup
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-INTERVAL = 5                                    # segundos entre rondas
+INTERVAL = float(os.environ.get("INTERVAL", 20))        # segundos por ronda completa
 MAX_SECONDS = int(os.environ.get("MAX_SECONDS", 350 * 60))
-REMINDER = 300                                  # repetir aviso cada 5 min mientras siga disponible
-MAX_PRICE = float(os.environ.get("MAX_PRICE", 0))  # 0 = sin límite
+REMINDER = 300                                          # repetir aviso cada 5 min si sigue disponible
+MAX_PRICE = float(os.environ.get("MAX_PRICE", 0))       # 0 = sin límite
 
 PRODUCTS = {
     "Mini latas (ES)": "https://www.carrefour.es/pokemon-30th-aniversario-mini-latas-6-anos-unboxing/VC4A-34535247/p",
@@ -17,27 +17,32 @@ PRODUCTS = {
     "Lote 6 sobres (EN)": "https://www.carrefour.es/pokemon-caja-lote-6-sobres-30th-aniversario-ingles-juego-de-mesa-6-anos-unboxing/VC4A-34530764/p",
     "Lote 6 sobres (ES)": "https://www.carrefour.es/pokemon-caja-lote-6-sobres-30th-aniversario-juego-de-mesa-6-anos-unboxing/VC4A-34530762/p",
     "Caja Premium Ditto (EN)": "https://www.carrefour.es/pokemon-caja-30th-aniversario-coleccion-premium-dito-ingles-6-anos/VC4A-34535239/p",
-    # Producto de control (con stock). Descomenta SOLO para probar con --test:
-    # "TEST caja con póster": "https://www.carrefour.es/pokemon-30th-aniversario-caja-coleccion-con-poster-6-anos-unboxing/VC4A-34535256/p",
+}
+# Producto de control con stock: solo se usa en modo --test
+TEST_PRODUCT = {
+    "TEST caja con póster": "https://www.carrefour.es/pokemon-30th-aniversario-caja-coleccion-con-poster-6-anos-unboxing/VC4A-34535256/p",
 }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept-Language": "es-ES,es;q=0.9",
-    "Accept": "text/html,application/xhtml+xml",
-}
 NOT_AVAILABLE = ("agotado temporalmente", "agotado", "próximamente", "sin stock", "no disponible")
 
-session = requests.Session()
-session.headers.update(HEADERS)
+session = None
+
+
+def new_session():
+    """Sesión nueva que imita a Chrome (TLS + cabeceras) y guarda cookies de la portada."""
+    global session
+    session = cr.Session(impersonate="chrome")
+    try:
+        session.get("https://www.carrefour.es/", timeout=15)
+    except Exception:
+        pass
 
 
 def telegram(text):
     try:
-        session.post(
+        requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": False},
+            json={"chat_id": CHAT_ID, "text": text},
             timeout=10,
         )
     except requests.RequestException as e:
@@ -47,7 +52,7 @@ def telegram(text):
 def check(item):
     name, url = item
     try:
-        r = session.get(url, timeout=10)
+        r = session.get(url, timeout=15)
         if r.status_code != 200:
             return name, url, f"error:{r.status_code}", None, None
 
@@ -60,7 +65,6 @@ def check(item):
         if any(k in low for k in NOT_AVAILABLE):
             return name, url, "no", None, None
 
-        # Botón "Añadir" como línea propia (evita coincidencias tipo "añadir a favoritos")
         has_add = any(line.strip().lower() == "añadir" for line in text.split("\n"))
         if not has_add:
             return name, url, "desconocido", None, None
@@ -70,52 +74,71 @@ def check(item):
         seller = seller.group(1).strip() if seller else "?"
         price_val = float(price.group(1).replace(".", "").replace(",", ".")) if price else None
         return name, url, "si", seller, price_val
-    except requests.RequestException as e:
+    except Exception as e:
         return name, url, f"error:{type(e).__name__}", None, None
 
 
 def main():
+    new_session()
+
     if "--test" in sys.argv:
-        telegram("✅ Bot de Carrefour funcionando")
-        for res in map(check, PRODUCTS.items()):
-            print(res)
+        items = list({**PRODUCTS, **TEST_PRODUCT}.items())
+        results = []
+        for item in items:
+            res = check(item)
+            print(res, flush=True)
+            results.append(res)
+            time.sleep(1)
+        ok = sum(1 for r_ in results if not r_[2].startswith("error"))
+        telegram(f"🧪 Test Carrefour: {ok}/{len(results)} páginas leídas correctamente.\n"
+                 + "\n".join(f"{r_[0]}: {r_[2]}" for r_ in results))
         return
 
-    telegram("🤖 Monitor iniciado")
-    last_alert = {}            # nombre -> timestamp del último aviso
-    errors = 0
+    telegram(f"🤖 Monitor iniciado (cada {INTERVAL:.0f}s por producto)")
+    last_alert = {}
+    bad_rounds = 0
     warned = False
     end = time.time() + MAX_SECONDS
+    pause = INTERVAL / len(PRODUCTS)
 
-    with ThreadPoolExecutor(max_workers=len(PRODUCTS)) as pool:
-        while time.time() < end:
-            start = time.time()
-            results = list(pool.map(check, PRODUCTS.items()))
+    while time.time() < end:
+        round_results = []
+        for item in PRODUCTS.items():
+            name, url, status, seller, price = check(item)
+            round_results.append((name, status))
 
-            n_err = sum(1 for r_ in results if r_[2].startswith("error"))
-            errors = errors + 1 if n_err == len(results) else 0
-            if errors >= 12 and not warned:
-                telegram("⚠️ Carrefour parece estar bloqueando las peticiones.")
-                warned = True
-            if errors == 0:
-                warned = False
-
-            for name, url, status, seller, price in results:
-                if status == "si":
-                    if MAX_PRICE and price and price > MAX_PRICE:
-                        continue    # reventa por encima de tu precio máximo
+            if status == "si":
+                if not (MAX_PRICE and price and price > MAX_PRICE):
                     if time.time() - last_alert.get(name, 0) > REMINDER:
                         p = f"{price:.2f} €" if price else "precio ?"
                         telegram(f"🟢 ¡DISPONIBLE!\n{name}\nVendedor: {seller} · {p}\n{url}")
                         last_alert[name] = time.time()
-                elif status == "no":
-                    last_alert.pop(name, None)
-                elif status == "desconocido":
-                    print(f"[?] Estado no reconocido: {name}", flush=True)
+            elif status == "no":
+                last_alert.pop(name, None)
+            elif status == "desconocido":
+                print(f"[?] Estado no reconocido: {name}", flush=True)
 
-            print(time.strftime("%H:%M:%S"),
-                  {r_[0]: r_[2] for r_ in results}, flush=True)
-            time.sleep(max(0, INTERVAL - (time.time() - start)))
+            time.sleep(pause * random.uniform(0.6, 1.4))
+
+        print(time.strftime("%H:%M:%S"), dict(round_results), flush=True)
+
+        if all(s.startswith("error") for _, s in round_results):
+            bad_rounds += 1
+            codes = sorted({s for _, s in round_results})
+            if bad_rounds >= 3 and not warned:
+                telegram(f"⚠️ Carrefour parece bloquear las peticiones ({', '.join(codes)}). "
+                         f"Reduzco el ritmo y sigo intentándolo.")
+                warned = True
+            wait = min(300, 30 * bad_rounds)
+            print(f"Bloqueo: esperando {wait}s", flush=True)
+            time.sleep(wait)
+            if bad_rounds % 3 == 0:
+                new_session()
+        else:
+            if warned:
+                telegram("✅ Conexión con Carrefour recuperada.")
+            bad_rounds = 0
+            warned = False
 
 
 if __name__ == "__main__":

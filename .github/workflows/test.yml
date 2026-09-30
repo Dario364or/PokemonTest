@@ -1,27 +1,19 @@
-name: Monitor Carrefour
+name: Test Carrefour
 
 on:
-  schedule:
-    - cron: "0 * * * *"
   workflow_dispatch:
 
-concurrency:
-  group: carrefour-monitor
-  cancel-in-progress: false
-
 jobs:
-  monitor:
+  test:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install requests beautifulsoup4 curl_cffi
-      - run: python monitor.py
+      - run: python monitor.py --test
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MAX_PRICE: "30"
-          INTERVAL: "20"
