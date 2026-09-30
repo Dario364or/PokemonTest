@@ -49,7 +49,7 @@ def telegram(text):
         print("Error Telegram:", e, flush=True)
 
 
-def check(item):
+def _check(item):
     name, url = item
     try:
         r = session.get(url, timeout=15)
@@ -76,6 +76,14 @@ def check(item):
         return name, url, "si", seller, price_val
     except Exception as e:
         return name, url, f"error:{type(e).__name__}", None, None
+
+def check(item):
+    res = _check(item)
+    if res[2].startswith("error"):
+        time.sleep(random.uniform(1, 3))
+        new_session()                     # cookies y huella nuevas
+        res = _check(item)                # segundo intento
+    return res
 
 
 def main():
